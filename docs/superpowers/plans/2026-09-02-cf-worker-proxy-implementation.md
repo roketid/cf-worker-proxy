@@ -1389,4 +1389,342 @@ git commit -m "Add README documenting config schema, setup, and known limitation
 - [ ] **Step 3: Final full verification**
 
 Run: `npm test && npm run typecheck`
-Expected: all tests PASS, typecheck exits 0. This is the last task — the project is now feature-complete per the spec.
+Expected: all tests PASS, typecheck exits 0. Tasks 1–7 are feature-complete per the spec; Task 8 below is a later addition (edge caching for static assets, not in the original spec).
+
+---
+
+### Task 8: Static asset edge caching (config-driven TTL)
+
+**Why:** JS/CSS/image requests are separate proxied requests, not folded into "one page view" — a static-asset-heavy site burns through a request-metered plan far faster than page-view intuition suggests. Caching matching static assets at the edge (Workers `Cache` API) cuts origin load and latency; it does not reduce Cloudflare's bill to you (the Worker still runs per request either way), so this is a product/performance feature, not a cost-cutting one.
+
+**Files:**
+- Modify: `src/types.ts` (add `CacheConfig`, add `cache?: CacheConfig` to `ProxyConfig`)
+- Modify: `src/router.ts` (cache lookup before proxying, cache write after a cacheable fetch; `serveProxy`/`handleFallback`/`handleRequest` gain an optional `ctx` parameter)
+- Modify: `src/index.ts` (pass the real `ctx` through to `handleRequest`)
+- Modify: `README.md` (document the `cache` config field)
+- Test: `test/cache.test.ts`
+
+**Interfaces:**
+- Consumes: the Workers `caches.default` global (Cache API), `ProxyConfig` (Task 2), `serveProxy`/`handleRequest` (Task 5).
+- Produces:
+  - `interface CacheConfig { extensions: string[]; ttl_seconds: number }`
+  - `ProxyConfig.cache?: CacheConfig`
+  - `handleRequest(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response>` — **signature change**, `ctx` is appended as an optional third parameter so existing call sites (`test/router-dispatch.test.ts`, which calls `handleRequest(request, env)` with no `ctx`) keep compiling and passing unchanged; without `ctx`, cache reads still work but cache writes are skipped (no `waitUntil` to hang the write off of).
+
+- [ ] **Step 1: Add `CacheConfig` to `src/types.ts`**
+
+Add this interface and field (don't remove anything existing):
+
+```typescript
+export interface CacheConfig {
+  extensions: string[];
+  ttl_seconds: number;
+}
+```
+
+Add `cache?: CacheConfig;` to the `ProxyConfig` interface, alongside the existing `static_index_file?: string;` field.
+
+- [ ] **Step 2: Write the failing test `test/cache.test.ts`**
+
+```typescript
+import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
+import { http, HttpResponse } from "msw";
+import { describe, expect, it } from "vitest";
+import worker from "../src/index";
+import type { Env } from "../src/types";
+import { network } from "./server";
+
+function toBase64(obj: unknown): string {
+  return btoa(JSON.stringify(obj));
+}
+
+async function run(request: Request, env: Env): Promise<Response> {
+  const ctx = createExecutionContext();
+  const response = await worker.fetch(request, env, ctx);
+  await waitOnExecutionContext(ctx);
+  return response;
+}
+
+describe("static asset edge caching", () => {
+  it("serves a cache hit on the second request without a second upstream fetch", async () => {
+    network.use(
+      http.get("https://cache-hit.example.com/app.js", () => HttpResponse.text("console.log(1)"), {
+        once: true,
+      })
+    );
+    const env: Env = {
+      PROXY_CONFIG: toBase64({
+        "cache-hit.example.com": {
+          upstream: "https://cache-hit.example.com",
+          cache: { extensions: [".js"], ttl_seconds: 60 },
+        },
+      }),
+    };
+
+    const first = await run(new Request("https://cache-hit.example.com/app.js"), env);
+    expect(await first.text()).toBe("console.log(1)");
+
+    const second = await run(new Request("https://cache-hit.example.com/app.js"), env);
+    expect(await second.text()).toBe("console.log(1)");
+  });
+
+  it("sets a Cache-Control max-age matching the configured ttl_seconds on the cached copy", async () => {
+    network.use(
+      http.get("https://cache-ttl.example.com/style.css", () => HttpResponse.text("body{}"), {
+        once: true,
+      })
+    );
+    const env: Env = {
+      PROXY_CONFIG: toBase64({
+        "cache-ttl.example.com": {
+          upstream: "https://cache-ttl.example.com",
+          cache: { extensions: [".css"], ttl_seconds: 120 },
+        },
+      }),
+    };
+
+    await run(new Request("https://cache-ttl.example.com/style.css"), env);
+    const cached = await run(new Request("https://cache-ttl.example.com/style.css"), env);
+    expect(cached.headers.get("Cache-Control")).toBe("public, max-age=120");
+  });
+
+  it("does not cache a path whose extension isn't in the configured list", async () => {
+    let upstreamHits = 0;
+    network.use(
+      http.get("https://cache-skip.example.com/page.html", () => {
+        upstreamHits += 1;
+        return HttpResponse.text("<html></html>");
+      })
+    );
+    const env: Env = {
+      PROXY_CONFIG: toBase64({
+        "cache-skip.example.com": {
+          upstream: "https://cache-skip.example.com",
+          cache: { extensions: [".js"], ttl_seconds: 60 },
+        },
+      }),
+    };
+
+    await run(new Request("https://cache-skip.example.com/page.html"), env);
+    await run(new Request("https://cache-skip.example.com/page.html"), env);
+    expect(upstreamHits).toBe(2);
+  });
+
+  it("does not cache a non-2xx response", async () => {
+    let upstreamHits = 0;
+    network.use(
+      http.get("https://cache-error.example.com/broken.js", () => {
+        upstreamHits += 1;
+        return new HttpResponse("nope", { status: 500 });
+      })
+    );
+    const env: Env = {
+      PROXY_CONFIG: toBase64({
+        "cache-error.example.com": {
+          upstream: "https://cache-error.example.com",
+          cache: { extensions: [".js"], ttl_seconds: 60 },
+        },
+      }),
+    };
+
+    await run(new Request("https://cache-error.example.com/broken.js"), env);
+    await run(new Request("https://cache-error.example.com/broken.js"), env);
+    expect(upstreamHits).toBe(2);
+  });
+
+  it("does not cache when no cache config is set on the host", async () => {
+    let upstreamHits = 0;
+    network.use(
+      http.get("https://no-cache-config.example.com/app.js", () => {
+        upstreamHits += 1;
+        return HttpResponse.text("console.log(1)");
+      })
+    );
+    const env: Env = {
+      PROXY_CONFIG: toBase64({
+        "no-cache-config.example.com": { upstream: "https://no-cache-config.example.com" },
+      }),
+    };
+
+    await run(new Request("https://no-cache-config.example.com/app.js"), env);
+    await run(new Request("https://no-cache-config.example.com/app.js"), env);
+    expect(upstreamHits).toBe(2);
+  });
+});
+```
+
+- [ ] **Step 3: Run the test to verify it fails**
+
+Run: `npm test -- test/cache.test.ts`
+Expected: FAIL — `cache` is not a recognized field on `ProxyConfig` yet (typecheck) and no caching behavior exists, so the first two tests fail (msw's `{ once: true }` handler would be exhausted or the second request would error since nothing serves it from cache).
+
+- [ ] **Step 4: Update `src/router.ts` to add caching**
+
+Add this import to the top of `src/router.ts` (alongside the existing imports):
+
+```typescript
+import type { CacheConfig } from "./types";
+```
+
+Add this helper function above `serveProxy`:
+
+```typescript
+function matchesCacheExtension(request: Request, cache: CacheConfig): boolean {
+  const path = new URL(request.url).pathname.toLowerCase();
+  return cache.extensions.some((ext) => path.endsWith(ext.toLowerCase()));
+}
+```
+
+Replace the existing `serveProxy` function with:
+
+```typescript
+export async function serveProxy(
+  request: Request,
+  config: ProxyConfig,
+  ctx?: ExecutionContext
+): Promise<Response> {
+  if (!config.upstream) {
+    return jsonError(500, "Invalid upstream URL");
+  }
+
+  const isCacheableMethod = request.method === "GET" || request.method === "HEAD";
+  const cacheable = Boolean(config.cache) && isCacheableMethod && matchesCacheExtension(request, config.cache!);
+  const cache = caches.default;
+  const cacheKey = new Request(request.url, request);
+
+  if (cacheable) {
+    const cached = await cache.match(cacheKey);
+    if (cached) return cached;
+  }
+
+  const upstreamRequest = buildUpstreamRequest(request, config.upstream, config);
+  let upstreamResponse: Response;
+  try {
+    upstreamResponse = await fetch(upstreamRequest);
+  } catch {
+    return jsonError(502, "Bad gateway");
+  }
+
+  const response = applyResponseHeaders(upstreamResponse, config);
+
+  if (cacheable && response.ok && ctx) {
+    const cacheHeaders = new Headers(response.headers);
+    cacheHeaders.set("Cache-Control", `public, max-age=${config.cache!.ttl_seconds}`);
+    const responseToCache = new Response(response.clone().body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: cacheHeaders,
+    });
+    ctx.waitUntil(cache.put(cacheKey, responseToCache));
+  }
+
+  return response;
+}
+```
+
+Update `handleFallback` to accept and forward `ctx`:
+
+```typescript
+export async function handleFallback(
+  request: Request,
+  config: ProxyConfig,
+  ctx?: ExecutionContext
+): Promise<Response> {
+  switch (config.fallback_behavior) {
+    case "fallback_upstream":
+      if (config.fallback_upstream) {
+        return serveProxy(request, { ...config, upstream: config.fallback_upstream }, ctx);
+      }
+      return jsonError(502, "No fallback upstream configured");
+    case "404":
+      return jsonError(404, "Not found");
+    case "bad_gateway":
+      return jsonError(502, "Bad gateway");
+    default:
+      return jsonError(403, "Forbidden");
+  }
+}
+```
+
+Update `handleRequest` to accept and forward `ctx`:
+
+```typescript
+export async function handleRequest(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
+  const configs = getConfig(env);
+  const host = new URL(request.url).hostname;
+  const config = configs[host];
+
+  if (!config) {
+    return handleNoMatch(request, configs[WILDCARD_HOST], env);
+  }
+
+  if (config.routes && config.routes.length > 0) {
+    const route = matchRoute(request, config.routes);
+    if (route) {
+      return serveProxy(request, effectiveConfig(config, route), ctx);
+    }
+    return handleFallback(request, config, ctx);
+  }
+
+  if (config.condition && !checkCondition(request, config.condition)) {
+    return handleFallback(request, config, ctx);
+  }
+
+  return serveProxy(request, config, ctx);
+}
+```
+
+- [ ] **Step 5: Update `src/index.ts` to pass the real `ctx` through**
+
+Replace the `_ctx: ExecutionContext` parameter and the `handleRequest` call:
+
+```typescript
+import { handleRequest } from "./router";
+import type { Env } from "./types";
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const response = await handleRequest(request, env, ctx);
+    const url = new URL(request.url);
+    console.log(`${request.method} ${url.hostname}${url.pathname} -> ${response.status}`);
+    return response;
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+- [ ] **Step 6: Run the test to verify it passes**
+
+Run: `npm test -- test/cache.test.ts`
+Expected: PASS (5 passed).
+
+- [ ] **Step 7: Run the full test suite and typecheck**
+
+Run: `npm test && npm run typecheck`
+Expected: all tests across every file PASS (including the pre-existing `router-dispatch.test.ts` and `index.test.ts`, unaffected by the optional `ctx` parameter), typecheck exits 0.
+
+- [ ] **Step 8: Document the `cache` field in `README.md`**
+
+Add this subsection to `README.md`, after the "### Path rewriting" section:
+
+```markdown
+### Static asset edge caching
+
+```json
+{
+  "cache": { "extensions": [".js", ".css", ".png", ".woff2"], "ttl_seconds": 3600 }
+}
+```
+
+Responses to `GET`/`HEAD` requests whose path ends in one of `extensions` are cached at
+the edge (Workers `Cache` API) for `ttl_seconds`, served on subsequent matching requests
+without hitting the upstream. Only successful (`2xx`) responses are cached. This reduces
+load on your upstream and improves latency — it does not reduce the request count billed
+by Cloudflare, since the Worker still runs on every request whether it's a cache hit or not.
+```
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add src/types.ts src/router.ts src/index.ts test/cache.test.ts README.md
+git commit -m "Add config-driven edge caching for static assets with TTL"
+```
