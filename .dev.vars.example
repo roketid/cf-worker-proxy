@@ -1,0 +1,5 @@
+# Copy to .dev.vars (gitignored) and fill in real values for local dev.
+# PROXY_CONFIG must be base64-encoded JSON — see README.md for the schema.
+PROXY_CONFIG=eyJleGFtcGxlLmNvbSI6eyJ1cHN0cmVhbSI6Imh0dHBzOi8vZXhhbXBsZS5jb20ifX0=
+DEFAULT_UPSTREAM=
+DEFAULT_STATIC_INDEX_FILE=
