@@ -12,6 +12,11 @@ export interface Route {
   path_rewrite_replacement?: string;
 }
 
+export interface CacheConfig {
+  extensions: string[];
+  ttl_seconds: number;
+}
+
 export interface ProxyConfig {
   upstream?: string;
   request_headers?: Record<string, string>;
@@ -24,6 +29,7 @@ export interface ProxyConfig {
   path_rewrite_replacement?: string;
   routes?: Route[];
   static_index_file?: string;
+  cache?: CacheConfig;
 }
 
 export type ProxyConfigMap = Record<string, ProxyConfig>;

@@ -1,6 +1,6 @@
 import { getConfig } from "./config";
 import { applyResponseHeaders, buildUpstreamRequest } from "./modifier";
-import type { Env, ProxyConfig, ProxyCondition, Route } from "./types";
+import type { CacheConfig, Env, ProxyConfig, ProxyCondition, Route } from "./types";
 import { WILDCARD_HOST } from "./types";
 
 export function jsonError(status: number, message: string): Response {
@@ -44,24 +44,63 @@ function effectiveConfig(config: ProxyConfig, route: Route): ProxyConfig {
   };
 }
 
-export async function serveProxy(request: Request, config: ProxyConfig): Promise<Response> {
+function matchesCacheExtension(request: Request, cache: CacheConfig): boolean {
+  const path = new URL(request.url).pathname.toLowerCase();
+  return cache.extensions.some((ext) => path.endsWith(ext.toLowerCase()));
+}
+
+export async function serveProxy(
+  request: Request,
+  config: ProxyConfig,
+  ctx?: ExecutionContext
+): Promise<Response> {
   if (!config.upstream) {
     return jsonError(500, "Invalid upstream URL");
   }
+
+  const isCacheableMethod = request.method === "GET" || request.method === "HEAD";
+  const cacheable = Boolean(config.cache) && isCacheableMethod && matchesCacheExtension(request, config.cache!);
+  const cache = caches.default;
+  const cacheKey = new Request(request.url, request);
+
+  if (cacheable) {
+    const cached = await cache.match(cacheKey);
+    if (cached) return cached;
+  }
+
   const upstreamRequest = buildUpstreamRequest(request, config.upstream, config);
+  let upstreamResponse: Response;
   try {
-    const upstreamResponse = await fetch(upstreamRequest);
-    return applyResponseHeaders(upstreamResponse, config);
+    upstreamResponse = await fetch(upstreamRequest);
   } catch {
     return jsonError(502, "Bad gateway");
   }
+
+  const response = applyResponseHeaders(upstreamResponse, config);
+
+  if (cacheable && response.ok && ctx) {
+    const cacheHeaders = new Headers(response.headers);
+    cacheHeaders.set("Cache-Control", `public, max-age=${config.cache!.ttl_seconds}`);
+    const responseToCache = new Response(response.clone().body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: cacheHeaders,
+    });
+    ctx.waitUntil(cache.put(cacheKey, responseToCache));
+  }
+
+  return response;
 }
 
-export async function handleFallback(request: Request, config: ProxyConfig): Promise<Response> {
+export async function handleFallback(
+  request: Request,
+  config: ProxyConfig,
+  ctx?: ExecutionContext
+): Promise<Response> {
   switch (config.fallback_behavior) {
     case "fallback_upstream":
       if (config.fallback_upstream) {
-        return serveProxy(request, { ...config, upstream: config.fallback_upstream });
+        return serveProxy(request, { ...config, upstream: config.fallback_upstream }, ctx);
       }
       return jsonError(502, "No fallback upstream configured");
     case "404":
@@ -92,7 +131,7 @@ export async function handleNoMatch(
   return jsonError(502, "No upstream for host");
 }
 
-export async function handleRequest(request: Request, env: Env): Promise<Response> {
+export async function handleRequest(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
   const configs = getConfig(env);
   const host = new URL(request.url).hostname;
   const config = configs[host];
@@ -104,14 +143,14 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   if (config.routes && config.routes.length > 0) {
     const route = matchRoute(request, config.routes);
     if (route) {
-      return serveProxy(request, effectiveConfig(config, route));
+      return serveProxy(request, effectiveConfig(config, route), ctx);
     }
-    return handleFallback(request, config);
+    return handleFallback(request, config, ctx);
   }
 
   if (config.condition && !checkCondition(request, config.condition)) {
-    return handleFallback(request, config);
+    return handleFallback(request, config, ctx);
   }
 
-  return serveProxy(request, config);
+  return serveProxy(request, config, ctx);
 }

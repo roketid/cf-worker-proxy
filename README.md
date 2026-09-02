@@ -86,6 +86,20 @@ A `"*"` entry handles requests whose `Host` matches nothing else — either `ups
 }
 ```
 
+### Static asset edge caching
+
+```json
+{
+  "cache": { "extensions": [".js", ".css", ".png", ".woff2"], "ttl_seconds": 3600 }
+}
+```
+
+Responses to `GET`/`HEAD` requests whose path ends in one of `extensions` are cached at
+the edge (Workers `Cache` API) for `ttl_seconds`, served on subsequent matching requests
+without hitting the upstream. Only successful (`2xx`) responses are cached. This reduces
+load on your upstream and improves latency — it does not reduce the request count billed
+by Cloudflare, since the Worker still runs on every request whether it's a cache hit or not.
+
 ## Attaching multiple domains
 
 Add each domain under the Worker's **Settings → Domains & Routes** in the Cloudflare
