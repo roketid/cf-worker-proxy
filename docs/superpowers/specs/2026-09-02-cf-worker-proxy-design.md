@@ -23,7 +23,6 @@ In scope — full parity with `echo-proxy`'s routing feature set:
   (`response_headers`) and removal (`remove_headers`).
 - Path rewriting via regex (`path_rewrite_regex` /
   `path_rewrite_replacement`).
-- `host_override` (Host header sent upstream).
 - Single `condition` + `fallback_behavior`
   (`fallback_upstream`/`404`/`bad_gateway`/default `403`).
 - Ordered `routes` (first-match-wins, condition types: `header`,
@@ -45,11 +44,30 @@ Explicitly out of scope (decided during brainstorming):
   — not meaningful for a Worker, which has a single fixed entry point.
 - Config-from-file and config-from-plain-JSON-file loading modes — the
   Worker only supports the base64-env-var form.
+- `host_override` (sending a Host header to the upstream that differs
+  from the upstream's own host). **Discovered during planning:**
+  Cloudflare's `fetch()` always derives the wire-level Host header from
+  the outgoing request's URL. The only way to decouple the Host header
+  from the actual connection target is `cf.resolveOverride`, and per
+  Cloudflare's docs it "will only take effect if both the URL host and
+  the host specified by `resolveOverride` are within your zone" — i.e.
+  both hosts must be domains on your own Cloudflare account, otherwise
+  it's silently ignored. Since this app's purpose is proxying to
+  **domains outside Cloudflare**, `resolveOverride` doesn't apply to
+  the real use case, and there is no other mechanism to send a
+  different Host header to an external upstream. `host_override` is
+  therefore dropped from the config schema entirely (decided
+  2026-09-02) rather than shipped as a field that silently no-ops for
+  every upstream this app is actually built to serve. The *default*
+  behavior — sending the upstream's own host as the Host header — is
+  unaffected and needs no special handling: it's simply what `fetch()`
+  to that URL already does.
 
 ## Config Source
 
-`PROXY_CONFIG`: a Worker binding (var for local/dev, `wrangler secret
-put PROXY_CONFIG` for anything containing sensitive values) holding
+`PROXY_CONFIG`: a Worker binding (`vars` in `wrangler.jsonc` for
+local/dev, `wrangler secret put PROXY_CONFIG` for anything containing
+sensitive values) holding
 the same base64-encoded JSON blob shape used today, keyed by hostname:
 
 ```json
@@ -77,8 +95,8 @@ version's `initializeConfigs` pre-compilation step.
 
 ## Static Fallback
 
-Cloudflare Workers Static Assets (`[assets] directory = "./public"` in
-`wrangler.toml`, bound as `env.ASSETS`) serves the file named by
+Cloudflare Workers Static Assets (`"assets": { "directory": "./public",
+"binding": "ASSETS" }` in `wrangler.jsonc`) serves the file named by
 `static_index_file` for the wildcard host, replacing Echo's `c.File()`
 call. This is the only case where the Worker does not proxy to an
 upstream at all.
@@ -102,7 +120,7 @@ test/
   modifier.test.ts
 public/
   index.html    (example static wildcard fallback page)
-wrangler.toml
+wrangler.jsonc
 package.json
 tsconfig.json
 README.md
@@ -116,19 +134,20 @@ README.md
    - No match → wildcard `"*"` entry: proxy to its `upstream` if set,
      else serve `static_index_file` via `env.ASSETS`, else `502`.
    - Match with `routes` → evaluate in order, first matching route (or
-     the first with no `condition`) wins; overrides `upstream`,
-     `host_override`, `path_rewrite_regex/replacement` on top of the
-     host-level config (headers/remove_headers stay host-level, same
-     as `effectiveConfig` in the Go code).
+     the first with no `condition`) wins; overrides `upstream` and
+     `path_rewrite_regex/replacement` on top of the host-level config
+     (headers/remove_headers stay host-level, same as `effectiveConfig`
+     in the Go code).
    - Match with a single `condition` and it fails → `handleFallback`:
      `fallback_behavior` of `fallback_upstream` (proxy to
      `fallback_upstream`), `404`, `bad_gateway`, or default `403`, each
      returned as `{"error": "..."}` JSON like the Go version.
    - Match, condition passes (or none set) → proxy normally.
 3. `modifier.ts` builds the outgoing `Request`: rewrites `pathname` via
-   the compiled regex if configured, sets `Host` to `host_override` or
-   the upstream's own host, applies `request_headers`, sets
-   `X-Forwarded-For` from `request.headers.get('CF-Connecting-IP')`.
+   the compiled regex if configured, targets the upstream's own URL
+   (so its Host header is whatever `fetch()` naturally sends for that
+   URL), applies `request_headers`, sets `X-Forwarded-For` from
+   `request.headers.get('CF-Connecting-IP')`.
 4. Worker calls `fetch(upstreamRequest)`. Network failure → caught,
    logged, `502 {"error": "..."}` returned (matching
    `httputil.ReverseProxy`'s default error behavior).
@@ -152,16 +171,19 @@ single-handler Worker.
 
 ## Testing
 
-Vitest + `@cloudflare/vitest-pool-workers` (the standard Workers-native
-test runtime, runs tests inside `workerd`). Test coverage mirrors
-`tests/proxy_test.go`:
+Vitest + `@cloudflare/vitest-plugin` (the current Cloudflare-maintained
+Vite/Vitest plugin that runs tests inside the real `workerd` runtime;
+supersedes the older `@cloudflare/vitest-pool-workers`). Outbound
+`fetch()` calls to upstreams are mocked with `@msw/cloudflare` (MSW),
+Cloudflare's documented approach for this test runner, so tests never
+hit real networks. Test coverage mirrors `tests/proxy_test.go`:
 - Host match / no match → wildcard upstream / wildcard static file /
   default 502.
 - Single `condition` (header, query param) pass/fail → fallback
   behaviors (`fallback_upstream`, `404`, `bad_gateway`, default).
 - `routes`: ordered evaluation, `path_prefix` condition, catch-all
-  route with no condition, per-route `host_override` and path rewrite
-  overrides layered on host-level headers.
+  route with no condition, per-route path rewrite overrides layered on
+  host-level headers.
 - Path rewrite regex replacement.
 - `request_headers` set, `response_headers` set, `remove_headers`
   deleted.
