@@ -118,3 +118,12 @@ curl -i https://<your-attached-domain>/some/path
 Confirm: the response comes from the configured upstream, configured request/response
 headers are present, `remove_headers` are absent, and an unmatched host either proxies
 to the wildcard upstream, serves the static fallback page, or returns `502`.
+
+## License
+
+MIT with the [Commons Clause](https://commonsclause.com/) condition — see
+[`LICENSE`](./LICENSE). Free to use, modify, and self-host. Offering this
+software (or a product substantially derived from it) as a paid
+Software-as-a-Service or Platform-as-a-Service product to third parties
+requires a separate commercial license — see
+[`LICENSE-COMMERCIAL.md`](./LICENSE-COMMERCIAL.md).
