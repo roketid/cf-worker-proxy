@@ -100,6 +100,130 @@ without hitting the upstream. Only successful (`2xx`) responses are cached. This
 load on your upstream and improves latency — it does not reduce the request count billed
 by Cloudflare, since the Worker still runs on every request whether it's a cache hit or not.
 
+## Request logs (opt-in)
+
+Stripe-style request logs: when enabled, every proxied request is written as one JSON
+object to an S3 or S3-compatible bucket (AWS S3, Cloudflare R2, MinIO, DigitalOcean
+Spaces, Backblaze B2, ...), holding the request and response headers and bodies. It is
+off unless you turn it on.
+
+Turn it on for all hosts with `REQUEST_LOG_ENABLED=true`, or per host in `PROXY_CONFIG`
+with `"request_log": true`. The per-host value wins, so `"request_log": false` excludes
+one host while the env flag is on.
+
+| Variable | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `REQUEST_LOG_ENABLED` | | off | `true` enables logging for every host |
+| `REQUEST_LOG_S3_ENDPOINT` | yes | | e.g. `https://s3.ap-southeast-1.amazonaws.com`, `https://<account>.r2.cloudflarestorage.com` |
+| `REQUEST_LOG_S3_BUCKET` | yes | | Bucket name (addressed path-style: `{endpoint}/{bucket}/{key}`) |
+| `REQUEST_LOG_S3_ACCESS_KEY_ID` | yes | | Set with `wrangler secret put` |
+| `REQUEST_LOG_S3_SECRET_ACCESS_KEY` | yes | | Set with `wrangler secret put` |
+| `REQUEST_LOG_S3_REGION` | | `auto` | Signing region; AWS needs the bucket's real region |
+| `REQUEST_LOG_S3_PREFIX` | | `request-logs` | Key prefix inside the bucket |
+| `REQUEST_LOG_MAX_BODY_BYTES` | | `65536` | Bodies longer than this are cut and marked `body_truncated` |
+| `REQUEST_LOG_MIN_STATUS` | | `0` | Only log responses with at least this status (`400` = failures only) |
+| `REQUEST_LOG_REDACT_HEADERS` | | | Comma-separated extra header names to redact |
+| `REQUEST_LOG_ENCRYPTION_KEY` | | | Base64 32-byte key; when set, log objects are encrypted. Blank = no encryption. Set with `wrangler secret put` |
+
+Every request gets an id, whether or not it is logged. It is sent to the upstream as an
+`X-Request-Log-Id: req_...` request header and returned to the client as a response header
+of the same name, so the client, the upstream's own logs and the log entry can all be
+matched. Any value the client sent under that name is replaced. An id only has a log
+object behind it when logging is on for that host and the response passes
+`REQUEST_LOG_MIN_STATUS`. Log objects are stored at
+`{prefix}/{YYYY}/{MM}/{DD}/{HH}/{id}_{status}.json` (UTC).
+
+Ids sort by time: after `req_` come 9 base36 digits holding the request's start time in
+milliseconds since the Unix epoch, then 16 random hex digits. So a bucket listing is in
+chronological order, and the hour folder can be worked out from the id alone
+(`parseInt(id.slice(4, 13), 36)` gives the timestamp). To fetch a failed request, list
+that hour with the id as a prefix:
+
+```sh
+aws s3 ls s3://my-bucket/request-logs/2026/11/11/08/req_0mwbu8c17 --endpoint-url "$REQUEST_LOG_S3_ENDPOINT"
+```
+
+```json
+{
+  "id": "req_0mwbu8c173f9a1c0b7d2e4f6a",
+  "timestamp": "2026-11-11T08:09:10.123Z",
+  "duration_ms": 182,
+  "client_ip": "203.0.113.7",
+  "cf_ray": "8f1c2d3e4f5a6b7c-SIN",
+  "metadata": { "user_id": "42" },
+  "request": {
+    "method": "POST",
+    "url": "https://api.example.com/charges?expand=customer",
+    "headers": { "content-type": "application/json", "authorization": "[REDACTED]" },
+    "body": "{\"amount\":500}",
+    "body_truncated": false
+  },
+  "response": {
+    "status": 402,
+    "headers": { "content-type": "application/json" },
+    "body": "{\"error\":\"card_declined\"}",
+    "body_truncated": false
+  }
+}
+```
+
+### Encrypting log objects
+
+Set `REQUEST_LOG_ENCRYPTION_KEY` to encrypt every log object before it leaves the Worker,
+so the storage provider and anyone with bucket access only see ciphertext. Leave it blank
+to store plain JSON.
+
+```sh
+openssl rand -base64 32 | wrangler secret put REQUEST_LOG_ENCRYPTION_KEY
+```
+
+- The key must be exactly 32 bytes, base64-encoded. If it is set but invalid, nothing is
+  logged (an error goes to the Worker's console) rather than falling back to plaintext.
+- Encrypted objects are named `{id}_{status}.json.enc` instead of `.json`. Object keys
+  (time, id, status) are not encrypted.
+- Format: AES-256-GCM, no additional data. The object is a 12-byte random nonce followed
+  by the ciphertext with the 16-byte tag appended, which is what Go's `cipher.AEAD`
+  expects:
+
+  ```go
+  key, _ := base64.StdEncoding.DecodeString(os.Getenv("REQUEST_LOG_ENCRYPTION_KEY"))
+  block, _ := aes.NewCipher(key)
+  gcm, _ := cipher.NewGCM(block)
+  plaintext, err := gcm.Open(nil, object[:12], object[12:], nil)
+  ```
+
+- Keep the key safe: objects cannot be read without it. After changing the key, older
+  objects still need the old key.
+
+### Adding upstream data to a log entry
+
+The upstream can attach its own data (user id, order number, internal error code, ...) by
+returning an `X-Request-Log-Metadata` response header:
+
+```
+X-Request-Log-Metadata: {"user_id":"42","error_code":"E_LIMIT"}
+```
+
+The value is stored in the entry's top-level `metadata` field: as parsed JSON when it is
+valid JSON, otherwise as a plain string. The header is always removed before the response
+reaches the client, whether or not the request is logged. Keep it to a few KB (it is an
+HTTP header, so non-ASCII text should be escaped as `\uXXXX` inside the JSON), and do not
+put secrets in it: metadata is stored unredacted.
+
+Things to know:
+
+- `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie` and `X-Api-Key` values are
+  always replaced with `[REDACTED]`. Bodies are stored as-is, so they can contain
+  credentials or personal data: restrict access to the bucket and set a lifecycle rule to
+  expire old logs.
+- Only text bodies (JSON, form, XML, `text/*`) are stored. Binary bodies and
+  `text/event-stream` are recorded as `"body": null` with a `body_omitted` reason.
+- The log records the request as the client sent it and the response as the client
+  received it; `duration_ms` is the time until response headers.
+- The upload happens after the response is returned and never affects it. If the upload
+  fails, the error goes to the Worker's console log and the request log is lost.
+- Each logged request costs one extra subrequest (the S3 `PUT`).
+
 ## Attaching multiple domains
 
 Add each domain under the Worker's **Settings → Domains & Routes** in the Cloudflare

@@ -1,5 +1,6 @@
 import { getConfig } from "./config";
 import { applyResponseHeaders, buildUpstreamRequest } from "./modifier";
+import { LOG_METADATA_HEADER } from "./request-log";
 import type { CacheConfig, Env, ProxyConfig, ProxyCondition, Route } from "./types";
 import { WILDCARD_HOST } from "./types";
 
@@ -80,6 +81,8 @@ export async function serveProxy(
 
   if (cacheable && response.ok && ctx) {
     const cacheHeaders = new Headers(response.headers);
+    // Metadata describes this one request; it must not be replayed on later cache hits.
+    cacheHeaders.delete(LOG_METADATA_HEADER);
     cacheHeaders.set("Cache-Control", `public, max-age=${config.cache!.ttl_seconds}`);
     const responseToCache = new Response(response.clone().body, {
       status: response.status,
