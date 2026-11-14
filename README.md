@@ -96,12 +96,37 @@ The name must be declared in `wrangler.jsonc`:
 
 `PROXY_CONFIG` can only name bindings that are already declared, so pointing at a new
 Worker needs a redeploy, not just a config change. The target Worker must be in the same
-Cloudflare account. A name that isn't declared returns `502 {"error":"Upstream not configured"}`.
+Cloudflare account.
 
-The bound Worker receives the request with the original host and scheme, the rewritten
-path (if `path_rewrite_*` is set) and the original query string. Request/response header
-changes, edge caching and request logs apply exactly as they do for URL upstreams.
-`fallback_upstream` is URL-only.
+What the bound Worker receives:
+
+- the original host and scheme, the rewritten path (if `path_rewrite_*` is set) and the
+  original query string
+- the client's headers, plus anything in `request_headers`
+- `X-Forwarded-For`, set from `CF-Connecting-IP`
+- `X-Request-Log-Id`, the same id that is returned to the client
+- the original method and body
+- the incoming `request.cf` (country, TLS details and so on), as if it had been called
+  directly
+
+Everything else behaves as it does for a URL upstream: `remove_headers` and
+`response_headers` are applied to the response, `cache` applies, and
+[request logs](#request-logs-opt-in) are written to S3, including
+`X-Request-Log-Metadata` sent back by the bound Worker.
+
+Things to know:
+
+- A name with no matching binding, or one that is a plain variable or secret, returns
+  `502 {"error":"Upstream not configured"}`.
+- Any binding that exposes `fetch` is accepted, not only services. `"binding": "ASSETS"`
+  serves static assets for the request path.
+- If the bound Worker throws, the client gets `502 {"error":"Bad gateway"}`.
+- `fallback_upstream` is URL-only. A host-level `binding` is not used for the fallback,
+  and it does not apply to a route that names its own `upstream`.
+- On the `"*"` host, only a host-level `binding` (or `upstream`) is used; `routes` are
+  not evaluated there.
+- Do not bind this Worker to itself. The request keeps its host, so it would match the
+  same config again and loop until Cloudflare's subrequest limit stops it.
 
 ### Wildcard host fallback
 
