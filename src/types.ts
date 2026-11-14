@@ -7,7 +7,9 @@ export interface ProxyCondition {
 
 export interface Route {
   condition?: ProxyCondition;
-  upstream: string;
+  upstream?: string;
+  /** Name of a service binding declared in wrangler.jsonc. Wins over `upstream`. */
+  binding?: string;
   path_rewrite_regex?: string;
   path_rewrite_replacement?: string;
 }
@@ -19,6 +21,8 @@ export interface CacheConfig {
 
 export interface ProxyConfig {
   upstream?: string;
+  /** Name of a service binding declared in wrangler.jsonc. Wins over `upstream`. */
+  binding?: string;
   request_headers?: Record<string, string>;
   response_headers?: Record<string, string>;
   remove_headers?: string[];

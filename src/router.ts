@@ -39,7 +39,9 @@ export function matchRoute(request: Request, routes: Route[]): Route | undefined
 function effectiveConfig(config: ProxyConfig, route: Route): ProxyConfig {
   return {
     ...config,
+    // Both come from the route, so a host-level binding never overrides a route's URL.
     upstream: route.upstream,
+    binding: route.binding,
     path_rewrite_regex: route.path_rewrite_regex ?? config.path_rewrite_regex,
     path_rewrite_replacement: route.path_rewrite_replacement ?? config.path_rewrite_replacement,
   };
@@ -50,12 +52,26 @@ function matchesCacheExtension(request: Request, cache: CacheConfig): boolean {
   return cache.extensions.some((ext) => path.endsWith(ext.toLowerCase()));
 }
 
+/** Returns the service binding called `name`, or undefined if `env` has no such service. */
+export function resolveBinding(env: Env, name: string): Fetcher | undefined {
+  const value = (env as unknown as Record<string, unknown>)[name];
+  if (typeof value !== "object" || value === null) return undefined;
+  return typeof (value as Fetcher).fetch === "function" ? (value as Fetcher) : undefined;
+}
+
 export async function serveProxy(
   request: Request,
   config: ProxyConfig,
+  env: Env,
   ctx?: ExecutionContext
 ): Promise<Response> {
-  if (!config.upstream) {
+  let service: Fetcher | undefined;
+  if (config.binding) {
+    service = resolveBinding(env, config.binding);
+    if (!service) {
+      return jsonError(502, "Upstream not configured");
+    }
+  } else if (!config.upstream) {
     return jsonError(500, "Invalid upstream URL");
   }
 
@@ -69,10 +85,12 @@ export async function serveProxy(
     if (cached) return cached;
   }
 
-  const upstreamRequest = buildUpstreamRequest(request, config.upstream, config);
+  // A bound Worker is addressed by the binding, not the URL, so it keeps the incoming origin.
+  const target = service ? new URL(request.url).origin : config.upstream!;
+  const upstreamRequest = buildUpstreamRequest(request, target, config);
   let upstreamResponse: Response;
   try {
-    upstreamResponse = await fetch(upstreamRequest);
+    upstreamResponse = await (service ? service.fetch(upstreamRequest) : fetch(upstreamRequest));
   } catch {
     return jsonError(502, "Bad gateway");
   }
@@ -98,12 +116,18 @@ export async function serveProxy(
 export async function handleFallback(
   request: Request,
   config: ProxyConfig,
+  env: Env,
   ctx?: ExecutionContext
 ): Promise<Response> {
   switch (config.fallback_behavior) {
     case "fallback_upstream":
       if (config.fallback_upstream) {
-        return serveProxy(request, { ...config, upstream: config.fallback_upstream }, ctx);
+        return serveProxy(
+          request,
+          { ...config, upstream: config.fallback_upstream, binding: undefined },
+          env,
+          ctx
+        );
       }
       return jsonError(502, "No fallback upstream configured");
     case "404":
@@ -123,8 +147,8 @@ export async function handleNoMatch(
   if (!config) {
     return jsonError(502, "No upstream for host");
   }
-  if (config.upstream) {
-    return serveProxy(request, config);
+  if (config.upstream || config.binding) {
+    return serveProxy(request, config, env);
   }
   if (config.static_index_file && env.ASSETS) {
     const assetUrl = new URL(request.url);
@@ -146,14 +170,14 @@ export async function handleRequest(request: Request, env: Env, ctx?: ExecutionC
   if (config.routes && config.routes.length > 0) {
     const route = matchRoute(request, config.routes);
     if (route) {
-      return serveProxy(request, effectiveConfig(config, route), ctx);
+      return serveProxy(request, effectiveConfig(config, route), env, ctx);
     }
-    return handleFallback(request, config, ctx);
+    return handleFallback(request, config, env, ctx);
   }
 
   if (config.condition && !checkCondition(request, config.condition)) {
-    return handleFallback(request, config, ctx);
+    return handleFallback(request, config, env, ctx);
   }
 
-  return serveProxy(request, config, ctx);
+  return serveProxy(request, config, env, ctx);
 }

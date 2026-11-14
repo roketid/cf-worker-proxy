@@ -70,6 +70,39 @@ or `path_prefix` (matched by prefix). `fallback_behavior` is one of `fallback_up
 Evaluated in order; the first matching route wins. A route with no `condition` is a
 catch-all and should go last. If no route matches, `fallback_behavior` applies.
 
+### Service bindings
+
+A route or a host can send traffic to another Worker through a
+[service binding](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/)
+instead of a URL, by naming the binding with `binding`:
+
+```json
+{
+  "routes": [
+    { "condition": { "path_prefix": "/portal/auth" }, "binding": "AUTH_BACKEND" },
+    { "upstream": "https://default.example.com" }
+  ]
+}
+```
+
+`binding` also works at host level (including `"*"`) in place of `upstream`. If both are
+set on the same route or host, `binding` wins.
+
+The name must be declared in `wrangler.jsonc`:
+
+```jsonc
+"services": [{ "binding": "AUTH_BACKEND", "service": "auth-backend" }]
+```
+
+`PROXY_CONFIG` can only name bindings that are already declared, so pointing at a new
+Worker needs a redeploy, not just a config change. The target Worker must be in the same
+Cloudflare account. A name that isn't declared returns `502 {"error":"Upstream not configured"}`.
+
+The bound Worker receives the request with the original host and scheme, the rewritten
+path (if `path_rewrite_*` is set) and the original query string. Request/response header
+changes, edge caching and request logs apply exactly as they do for URL upstreams.
+`fallback_upstream` is URL-only.
+
 ### Wildcard host fallback
 
 A `"*"` entry handles requests whose `Host` matches nothing else — either `upstream`

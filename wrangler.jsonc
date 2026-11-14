@@ -7,4 +7,7 @@
     "directory": "./public",
     "binding": "ASSETS"
   }
+  // Service bindings that PROXY_CONFIG can name with "binding": "<name>".
+  // Add a comma after the "assets" block above when uncommenting.
+  // "services": [{ "binding": "AUTH_BACKEND", "service": "auth-backend" }]
 }
