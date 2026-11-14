@@ -112,6 +112,18 @@ describe("handleRequest: service binding at host level", () => {
     expect(new URL(auth.calls[0].url).search).toBe("?a=1");
   });
 
+  it("passes the incoming request.cf to the bound Worker", async () => {
+    let seenCf: unknown;
+    const auth = fakeBinding((req) => {
+      seenCf = (req as Request & { cf?: unknown }).cf;
+      return new Response("ok");
+    });
+    const env = withBinding({ [HOST]: { binding: "AUTH_BACKEND" } }, { AUTH_BACKEND: auth });
+    const incoming = new Request(`https://${HOST}/x`, { cf: { country: "ID" } } as RequestInit);
+    await handleRequest(incoming, env);
+    expect(seenCf).toMatchObject({ country: "ID" });
+  });
+
   it("prefers binding when upstream is also set", async () => {
     const auth = fakeBinding(() => new Response("from auth worker"));
     const env = withBinding(

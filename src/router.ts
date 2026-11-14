@@ -90,7 +90,10 @@ export async function serveProxy(
   const upstreamRequest = buildUpstreamRequest(request, target, config);
   let upstreamResponse: Response;
   try {
-    upstreamResponse = await (service ? service.fetch(upstreamRequest) : fetch(upstreamRequest));
+    upstreamResponse = await (service
+      ? // Pass request.cf on, so the bound Worker sees it as if it were called directly.
+        service.fetch(new Request(upstreamRequest, { cf: request.cf }))
+      : fetch(upstreamRequest));
   } catch {
     return jsonError(502, "Bad gateway");
   }
